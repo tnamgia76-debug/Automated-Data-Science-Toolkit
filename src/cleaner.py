@@ -62,3 +62,40 @@ def get_correlation_matrix(df: pd.DataFrame) -> pd.DataFrame:
     numeric_df = df.select_dtypes(include=['number'])
     corr = numeric_df.corr()
     return corr
+
+def get_data_quality_summary(df: pd.DataFrame) -> dict:
+    """
+    Tóm tắt chất lượng dữ liệu để hiển thị KPI.
+    """
+    total_cells = df.shape[0] * df.shape[1]
+    total_missing = int(df.isnull().sum().sum())
+    missing_rate = total_missing / total_cells if total_cells > 0 else 0
+
+    return {
+        "rows": df.shape[0],
+        "columns": df.shape[1],
+        "total_missing": total_missing,
+        "missing_rate": missing_rate,
+        "duplicate_rows": int(df.duplicated().sum()),
+        "numeric_columns": len(df.select_dtypes(include=["number"]).columns),
+        "categorical_columns": len(df.select_dtypes(exclude=["number"]).columns),
+    }
+
+
+def get_top_missing_columns(df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
+    """
+    Lấy top cột có missing nhiều nhất.
+    """
+    missing_count = df.isnull().sum()
+    missing_percent = missing_count / len(df) * 100
+
+    result = pd.DataFrame({
+        "Cột": missing_count.index,
+        "Số lượng thiếu": missing_count.values,
+        "Tỷ lệ thiếu (%)": missing_percent.values
+    })
+
+    result = result[result["Số lượng thiếu"] > 0]
+    result = result.sort_values("Tỷ lệ thiếu (%)", ascending=False)
+
+    return result.head(top_n)

@@ -1,294 +1,789 @@
-#cài đặt các thư viện
-import plotly.graph_objects as go
+# =========================================================
+# APP: Automated Data Science Toolkit (ADST)
+# Mục tiêu:
+# - Upload nhiều file CSV/XLSX
+# - Xem Data Catalog
+# - Gợi ý quan hệ và merge bảng
+# - Clean dữ liệu
+# - EDA dashboard gọn theo tab
+# - Train Linear Regression cơ bản
+# - Export HTML report / CSV
+# =========================================================
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from src.cleaner import inspect_missing_values, auto_clean_data, get_correlation_matrix
+import plotly.express as px
+import plotly.graph_objects as go
+
+from src.cleaner import (
+    inspect_missing_values,
+    auto_clean_data,
+    get_correlation_matrix,
+    get_data_quality_summary,
+    get_top_missing_columns,
+)
+from src.loader import load_multiple_files, create_data_catalog
+from src.relationships import suggest_relationships, merge_two_tables
 from src.models import train_linear_regression
+from src.report import generate_html_report
 
-#1 Cấu hình trang web
-st.set_page_config(page_title = "Automated Data Science Toolkit", 
-                   page_icon = "📊",
-                   layout = "wide")
- 
-#2 Tiêu đề ứng dụng
+
+# =========================================================
+# 1. PAGE CONFIG
+# =========================================================
+
+st.set_page_config(
+    page_title="Automated Data Science Toolkit",
+    page_icon="📊",
+    layout="wide",
+)
+
+
+# =========================================================
+# 2. SESSION STATE
+# Streamlit rerun toàn bộ app mỗi lần user bấm nút.
+# Session state giúp giữ dữ liệu upload, dữ liệu clean,
+# dữ liệu merge và kết quả model.
+# =========================================================
+
+
+def init_session_state() -> None:
+    default_values = {
+        "datasets": {},
+        "active_dataset_name": None,
+        "cleaned_df": None,
+        "cleaned_source_name": None,
+        "cleaning_logs": [],
+        "model_metrics": None,
+        "model_coefficients": None,
+        "model_intercept": None,
+        "model_target": None,
+        "model_features": [],
+        "last_upload_signature": None,
+    }
+
+    for key, value in default_values.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_derived_states() -> None:
+    """Reset các kết quả phụ khi user upload bộ dữ liệu mới."""
+    st.session_state.cleaned_df = None
+    st.session_state.cleaned_source_name = None
+    st.session_state.cleaning_logs = []
+    st.session_state.model_metrics = None
+    st.session_state.model_coefficients = None
+    st.session_state.model_intercept = None
+    st.session_state.model_target = None
+    st.session_state.model_features = []
+
+
+init_session_state()
+
+
+# =========================================================
+# 3. HELPER FUNCTIONS
+# Các hàm nhỏ để app.py dễ đọc hơn.
+# =========================================================
+
+
+def get_upload_signature(uploaded_files) -> tuple | None:
+    """Tạo dấu hiệu nhận biết file upload đã thay đổi hay chưa."""
+    if not uploaded_files:
+        return None
+
+    return tuple((file.name, file.size) for file in uploaded_files)
+
+
+@st.cache_data(show_spinner="Đang đọc dữ liệu...")
+def cached_load_files(file_payloads: tuple) -> dict:
+    """
+    Cache việc đọc file để app không đọc lại CSV/XLSX quá nhiều lần.
+    file_payloads là tuple gồm (file_name, file_bytes).
+    """
+    class UploadedFileMock:
+        def __init__(self, name, data):
+            self.name = name
+            self._data = data
+            self.size = len(data)
+
+        def getvalue(self):
+            return self._data
+
+    mock_files = [UploadedFileMock(name, data) for name, data in file_payloads]
+    return load_multiple_files(mock_files)
+
+
+def get_current_dataframe(use_cleaned_data: bool) -> tuple[pd.DataFrame | None, str | None]:
+    """Lấy DataFrame đang được chọn để các tab dùng chung."""
+    if use_cleaned_data and st.session_state.cleaned_df is not None:
+        return st.session_state.cleaned_df, f"cleaned_{st.session_state.cleaned_source_name}"
+
+    active_name = st.session_state.active_dataset_name
+
+    if active_name and active_name in st.session_state.datasets:
+        return st.session_state.datasets[active_name], active_name
+
+    return None, None
+
+
+def show_metric_cards(df: pd.DataFrame) -> None:
+    """Hiển thị KPI tổng quan giống dashboard."""
+    quality = get_data_quality_summary(df)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+
+    col1.metric("Rows", f"{quality['rows']:,}")
+    col2.metric("Columns", f"{quality['columns']:,}")
+    col3.metric("Missing Cells", f"{quality['total_missing']:,}")
+    col4.metric("Missing Rate", f"{quality['missing_rate']:.2%}")
+    col5.metric("Duplicates", f"{quality['duplicate_rows']:,}")
+    col6.metric("Numeric Cols", quality["numeric_columns"])
+
+
+def make_download_csv_button(df: pd.DataFrame, label: str, file_name: str) -> None:
+    """Tạo nút download CSV, dùng utf-8-sig để Excel đọc tiếng Việt ổn hơn."""
+    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label=label,
+        data=csv_data,
+        file_name=file_name,
+        mime="text/csv",
+    )
+
+
+def safe_sample_dataframe(df: pd.DataFrame, sample_size: int) -> pd.DataFrame:
+    """Sample dữ liệu để vẽ biểu đồ nhanh hơn với dataset lớn."""
+    if len(df) <= sample_size:
+        return df
+
+    return df.sample(n=sample_size, random_state=42)
+
+
+# =========================================================
+# 4. SIDEBAR
+# Sidebar chứa nguồn dữ liệu và lựa chọn bảng đang phân tích.
+# =========================================================
+
 st.title("Automated Data Science Toolkit (ADST)")
-st.caption('Đề xuất giải pháp tự động hoá quy trình xử lý, khám phá và trực quan hoá dữ liệu.')
+st.caption(
+    "Mini workflow phân tích dữ liệu: upload nhiều file, catalog, merge, clean, EDA, Linear Regression và export report."
+)
 
-#3 Khởi tạo session state
-#streamlit sẽ chạy lại toàn bộ file từ trên xuống dưới khi người dùng bấm nút
-#session state để lưu giữ dữ liệu file đã update không bị mất đi
-if "raw_df" not in st.session_state:
-    st.session_state.raw_df = None #lưu dữ liệu gốc chưa qua xử lý
+with st.sidebar:
+    st.header("📁 Data Source")
 
-#4 Giao diện mục upload
-st.header("Bước 1: Tải lên dữ liệu nguồn")
-uploaded_file = st.file_uploader(label = "Hỗ trợ các định dạng tệp: .csv, .xlsx",
-                                 type = ["csv", "xlsx"])
+    uploaded_files = st.file_uploader(
+        label="Upload một hoặc nhiều file CSV/XLSX",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+    )
 
-#5 Logic đọc file
-if uploaded_file is not None:
-    try:
-        #kiểm tra đuôi file để dùng hàm đọc chính xác của pandas
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            df = pd.read_excel(uploaded_file)
+    upload_signature = get_upload_signature(uploaded_files)
 
-        #lưu vào bộ nhớ tạm của ứng dụng
-        st.session_state.raw_df = df
-        st.success(f"Tải tệp '{uploaded_file.name}' thành công")
-    except Exception as e:
-        st.error(f"Đã xảy ra lỗi khi đọc tệp: {e}")
+    if uploaded_files and upload_signature != st.session_state.last_upload_signature:
+        try:
+            file_payloads = tuple((file.name, file.getvalue()) for file in uploaded_files)
+            st.session_state.datasets = cached_load_files(file_payloads)
+            st.session_state.last_upload_signature = upload_signature
+            st.session_state.active_dataset_name = next(iter(st.session_state.datasets.keys()))
+            reset_derived_states()
+            st.success(f"Đã tải {len(st.session_state.datasets)} file.")
+        except Exception as e:
+            st.error(f"Lỗi khi đọc file: {e}")
 
-#6 Hiển thị thông tin sơ bộ khi dữ liệu được nạp thành công
-if st.session_state.raw_df is not None:
-    current_df = st.session_state.raw_df
+    if st.session_state.datasets:
+        dataset_names = list(st.session_state.datasets.keys())
 
-    st.markdown("Xem trước dữ liệu (5 dòng đầu tiên)")
-    st.dataframe(current_df.head(5))
+        selected_dataset = st.selectbox(
+            "Chọn bảng đang phân tích",
+            dataset_names,
+            index=dataset_names.index(st.session_state.active_dataset_name)
+            if st.session_state.active_dataset_name in dataset_names
+            else 0,
+        )
 
-    #Hiển thị các chỉ số tổng quan (Metrics)
-    st.markdown("Thống kê cấu trúc tệp")
-    col1, col2, col3 = st.columns(3)
+        st.session_state.active_dataset_name = selected_dataset
 
-    with col1:
-        st.metric(label = "Tổng số dòng (Rows)", value = f"{current_df.shape[0]:,}")
-    with col2:
-        st.metric(label = "Tổng số cột (Columns)", value = current_df.shape[1])
-    with col3:
-        total_missing = current_df.isnull().sum().sum()
-        st.metric(label = "Tổng số ô trống (Missing Cells)", value = f"{total_missing:,}")
-        
-    st.markdown("---")
-    st.header("Bước 2: Phân tích chất lượng & Làm sạch dữ liệu")
+        use_cleaned_data = False
+        if st.session_state.cleaned_df is not None:
+            use_cleaned_data = st.checkbox(
+                "Dùng bản đã clean cho EDA/Model/Report",
+                value=False,
+                help="Bật lựa chọn này sau khi bạn đã clean dữ liệu ở tab Clean Data.",
+            )
 
-    missing_report = inspect_missing_values(st.session_state.raw_df)
-    if not missing_report.empty:
-        st.warning("Phát hiện các cột bị thiếu dữ liệu:")
-        st.dataframe(missing_report)
+        st.markdown("---")
+        st.caption("Gợi ý: với dataset nhiều bảng như Olist, hãy vào tab Relationship Builder để merge từng cặp bảng thay vì gộp tất cả một lần.")
     else:
-        st.success("Bộ dữ liệu đủ, không có ô trống")
-    
-    # --- BƯỚC 2: LÀM SẠCH DỮ LIỆU TỰ ĐỘNG THÔNG MINH ---
-    st.markdown("#### Cấu hình bộ dụng cụ Clean dữ liệu tự động:")
-    
-    # Giao diện tinh gọn: Chỉ giữ lại 1 nút bấm duy nhất, hệ thống tự đưa ra quyết định thông minh
-    if st.button("Thực hiện Clean Dữ Liệu"):
-        # Gọi hàm xử lý thông minh (Hứng 2 kết quả đầu ra: dữ liệu sạch và nhật ký log)
-        cleaned_df, cleaning_logs = auto_clean_data(st.session_state.raw_df)
+        use_cleaned_data = False
 
-        # Lưu kết quả sau clean vào session_state dưới tên chuẩn 'cleaned_df'
-        st.session_state.cleaned_df = cleaned_df
-        st.session_state.cleaning_logs = cleaning_logs
 
-        st.success("Đã xử lý làm sạch dữ liệu thành công!")
+# =========================================================
+# 5. CHECK DATA LOADED
+# Nếu chưa upload dữ liệu thì dừng app tại đây.
+# =========================================================
 
-    # Hiển thị kết quả và nhật ký xử lý thông minh sau khi đã bấm nút Clean
-    if "cleaned_df" in st.session_state:
-        # 1. In ra các bước logic thông minh mà hệ thống đã tự động tính toán
-        st.markdown("#### Nhật ký xử lý thông minh (AI Cleaning Logs):")
-        if st.session_state.cleaning_logs:
-            for log in st.session_state.cleaning_logs:
-                st.code(log, language="text")
-        else:
-            st.info("Không phát hiện ô trống, hệ thống chỉ tự động kiểm tra trùng lặp.")
+df_current, current_dataset_name = get_current_dataframe(use_cleaned_data)
 
-        # 2. Hiển thị bảng dữ liệu sau khi xử lý
-        st.markdown("#### Kết quả sau khi Clean:")
-        st.dataframe(st.session_state.cleaned_df.head(5))
+if df_current is None:
+    st.info("Hãy upload ít nhất một file CSV hoặc XLSX để bắt đầu.")
+    st.stop()
 
-        # 3. So sánh số dòng trước và sau khi clean
-        old_shape = st.session_state.raw_df.shape[0]
-        new_shape = st.session_state.cleaned_df.shape[0]
-        st.info(f"Số lượng dòng ban đầu: {old_shape}, Sau khi clean còn: {new_shape} (Giảm {old_shape - new_shape} dòng).")
 
-    # Kiểm tra dữ liệu đã được clean chưa, chưa thì dùng tạm dữ liệu gốc
-    df_to_model = st.session_state.cleaned_df if "cleaned_df" in st.session_state else st.session_state.raw_df
+# =========================================================
+# 6. MAIN TABS
+# Chia app thành nhiều tab để không phải cuộn quá dài.
+# =========================================================
 
-# --- BƯỚC 2.5: KHÁM PHÁ DỮ LIỆU (EDA) & INTERACTIVE DASHBOARD ---
-    st.header("Bước 2.5: Khám phá dữ liệu & Dashboard tương tác")
-    
-    # Sử dụng dữ liệu đã clean nếu có, nếu chưa thì dùng tạm dữ liệu gốc
-    df_eda = st.session_state.cleaned_df if "cleaned_df" in st.session_state else st.session_state.raw_df
-    
-    # Nâng cấp lên thành 3 Tabs chuyên sâu
-    tab1, tab2, tab3 = st.tabs([
-        "Biểu đồ xu hướng (Scatter)", 
-        "Ma trận tương quan & Đề xuất biến", 
-        "Thống kê & Đọc Insight dữ liệu"
-    ])
-    
-    with tab1:
-        st.subheader("Trực quan hóa xu hướng tùy biến")
-        num_cols = df_eda.select_dtypes(include=['number']).columns.tolist()
-        
-        col_x, col_y = st.columns(2)
-        with col_x:
-            select_x = st.selectbox("Chọn trục X (Biến độc lập):", num_cols, index=num_cols.index('RM') if 'RM' in num_cols else 0)
-        with col_y:
-            select_y = st.selectbox("Chọn trục Y (Biến mục tiêu):", num_cols, index=num_cols.index('MEDV') if 'MEDV' in num_cols else 0)
-            
-        import plotly.express as px
-        # SỬA LỖI TẠI ĐÂY: Thay 'trendingline' bằng 'trendline' chuẩn của Plotly
-        fig_scatter = px.scatter(df_eda, x=select_x, y=select_y, 
-                                 title=f"Biểu đồ xu hướng: {select_x} vs {select_y}",
-                                 trendline="ols",  # Vẽ đường hồi quy tuyến tính sơ bộ
-                                 labels={select_x: select_x, select_y: select_y},
-                                 template="plotly_dark")
-        st.plotly_chart(fig_scatter, use_container_width=True)
+tab_overview, tab_catalog, tab_relationship, tab_clean, tab_eda, tab_model, tab_report = st.tabs([
+    "📊 Overview",
+    "🗂️ Data Catalog",
+    "🔗 Relationship Builder",
+    "🧹 Clean Data",
+    "📈 EDA Dashboard",
+    "🤖 Linear Regression",
+    "📤 Export Report",
+])
 
-    with tab2:
-        st.subheader("Ma trận tương quan hệ số (Correlation Matrix)")
-        corr_matrix = get_correlation_matrix(df_eda)
-        
-        fig_heatmap = px.imshow(corr_matrix, 
-                                text_auto=".2f", 
-                                aspect="auto",
-                                title="Bản đồ nhiệt tương quan giữa các đặc trưng",
-                                color_continuous_scale="RdBu_r",
-                                template="plotly_dark")
-        st.plotly_chart(fig_heatmap, use_container_width=True)
-        
-        st.markdown("####Trợ lý AI gợi ý chọn biến cho mô hình:")
-        target_for_suggest = st.selectbox("Chọn biến bạn muốn dự đoán để AI phân tích:", num_cols, index=num_cols.index('MEDV') if 'MEDV' in num_cols else 0)
-        
-        target_corr = corr_matrix[target_for_suggest].drop(target_for_suggest)
-        strong_features = target_corr[target_corr.abs() > 0.4].sort_values(ascending=False)
-        
-        if not strong_features.empty:
-            st.info(f"Dựa trên thuật toán phân tích tương quan, để dự đoán tốt nhất cho biến **{target_for_suggest}**, bạn nên chọn các biến sau vào danh sách **Features (X)** ở Bước 3:")
-            for f_name, f_val in strong_features.items():
-                status = "Tương quan thuận mạnh" if f_val > 0 else "Tương quan nghịch mạnh"
-                st.markdown(f"* **{f_name}** ({status}: `{f_val:.2f}`)")
-        else:
-            st.warning("Không tìm thấy biến nào có tương quan tuyến tính đủ mạnh với biến mục tiêu này.")
 
-    with tab3:
-        st.subheader("📊 Thống kê mô tả & Đọc Insight dữ liệu tự động")
-        
-        # 1. Hiển thị bảng thống kê mô tả gọn gàng
-        st.dataframe(df_eda.describe().T)
-        
-        st.markdown("### 🤖 Phân tích Insight tự động từ Hệ thống:")
-        
-        # Tính toán ma trận tương quan động dựa trên biến mục tiêu đang chọn
-        corr_matrix = get_correlation_matrix(df_eda)
-        if target_for_suggest in corr_matrix.columns:
-            # Lấy tương quan của biến mục tiêu với các biến khác, sắp xếp từ mạnh đến yếu
-            dynamic_corr = corr_matrix[target_for_suggest].drop(target_for_suggest).dropna()
-            
-            # Lấy top 3 biến có mức độ ảnh hưởng lớn nhất (trị tuyệt đối cao nhất)
-            top_features = dynamic_corr.abs().nlargest(3).index.tolist()
-            
-            if top_features:
-                for idx, feature in enumerate(top_features):
-                    corr_val = dynamic_corr[feature]
-                    
-                    # Sinh Insight động dựa theo dấu và độ mạnh của hệ số tương quan
-                    if corr_val > 0:
-                        direction = "Thuận (Tích cực)"
-                        behavior = f"Khi biến **{feature}** tăng, biến mục tiêu **{target_for_suggest}** cũng có xu hướng **TĂNG THEO**."
-                        box_type = st.success
-                    else:
-                        direction = "Nghịch (Tiêu cực)"
-                        behavior = f"Khi biến **{feature}** tăng, biến mục tiêu **{target_for_suggest}** lại có xu hướng **GIẢM XUỐNG**."
-                        box_type = st.error
-                        
-                    box_type(f"""
-                    **Top {idx+1} Ảnh hưởng: Biến `{feature}`** (Mức độ tương quan: `{corr_val:.2f}` - Hướng {direction})
-                    * {behavior} Đây là một đặc trưng vô cùng quan trọng mà bạn không nên bỏ qua khi huấn luyện mô hình dự đoán.
-                    """)
-            else:
-                st.warning("Hệ thống chưa tìm thấy mối tương quan tuyến tính nào đáng kể giữa các biến.")
+# =========================================================
+# 7. TAB OVERVIEW
+# Tóm tắt dataset đang phân tích bằng KPI + preview + missing chart.
+# =========================================================
 
-# =========================================================================
-    # --- BƯỚC 3: HUẤN LUYỆN MÔ HÌNH LINEAR REGRESSION (70-15-15) ---
-    # =========================================================================
+with tab_overview:
+    st.subheader("📊 Executive Overview")
+    st.caption(f"Dataset hiện tại: `{current_dataset_name}`")
+
+    show_metric_cards(df_current)
     st.markdown("---")
-    st.header("Bước 3: Huấn luyện mô hình Linear Regression (70-15-15)")
-    st.write("Chọn các biến số để dự đoán biến mục tiêu")
 
-    # Lọc ra danh sách các cột chỉ chứa kiểu số
-    numeric_cols = df_to_model.select_dtypes(include=[np.number]).columns.tolist()
+    left_col, right_col = st.columns([1.2, 1])
+
+    with left_col:
+        st.markdown("#### Preview dữ liệu")
+        st.dataframe(df_current.head(100), use_container_width=True)
+
+    with right_col:
+        st.markdown("#### Top Missing Columns")
+        top_missing = get_top_missing_columns(df_current)
+
+        if top_missing.empty:
+            st.success("Không có cột nào bị thiếu dữ liệu.")
+        else:
+            fig_missing = px.bar(
+                top_missing,
+                x="Cột",
+                y="Tỷ lệ thiếu (%)",
+                title="Top cột có tỷ lệ missing cao nhất",
+                template="plotly_dark",
+            )
+            st.plotly_chart(fig_missing, use_container_width=True)
+
+
+# =========================================================
+# 8. TAB DATA CATALOG
+# Khi upload nhiều file, tab này giúp xem toàn bộ bảng trong project.
+# =========================================================
+
+with tab_catalog:
+    st.subheader("🗂️ Data Catalog")
+    st.caption("Mỗi file upload được xem như một bảng dữ liệu riêng.")
+
+    catalog_df = create_data_catalog(st.session_state.datasets)
+    st.dataframe(catalog_df, use_container_width=True)
+
+    selected_preview_table = st.selectbox(
+        "Chọn bảng để xem chi tiết",
+        list(st.session_state.datasets.keys()),
+        key="catalog_preview_table",
+    )
+
+    preview_df = st.session_state.datasets[selected_preview_table]
+
+    st.markdown(f"#### Preview: `{selected_preview_table}`")
+    st.dataframe(preview_df.head(100), use_container_width=True)
+
+    with st.expander("Xem danh sách cột"):
+        st.write(list(preview_df.columns))
+
+
+# =========================================================
+# 9. TAB RELATIONSHIP BUILDER
+# Dùng cho dataset nhiều CSV. App tự gợi ý key trùng tên,
+# sau đó user chọn 2 bảng để merge.
+# =========================================================
+
+with tab_relationship:
+    st.subheader("🔗 Relationship Builder")
+
+    if len(st.session_state.datasets) < 2:
+        st.info("Cần upload ít nhất 2 bảng để sử dụng Relationship Builder.")
+    else:
+        st.markdown("#### Gợi ý quan hệ giữa các bảng")
+        relationships_df = suggest_relationships(st.session_state.datasets)
+
+        if relationships_df.empty:
+            st.warning("Không tìm thấy cột trùng tên giữa các bảng.")
+        else:
+            st.dataframe(relationships_df, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("#### Merge 2 bảng dữ liệu")
+
+        table_names = list(st.session_state.datasets.keys())
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            left_table = st.selectbox("Bảng chính", table_names, key="left_table")
+
+        with col_right:
+            right_candidates = [table for table in table_names if table != left_table]
+            right_table = st.selectbox("Bảng phụ", right_candidates, key="right_table")
+
+        common_cols = sorted(
+            list(
+                set(st.session_state.datasets[left_table].columns)
+                .intersection(set(st.session_state.datasets[right_table].columns))
+            )
+        )
+
+        if not common_cols:
+            st.warning("Hai bảng này không có cột trùng tên để merge.")
+        else:
+            join_key = st.selectbox("Chọn khóa nối", common_cols)
+            join_type = st.selectbox("Kiểu join", ["left", "inner", "right", "outer"])
+
+            left_shape = st.session_state.datasets[left_table].shape
+            right_shape = st.session_state.datasets[right_table].shape
+
+            st.info(
+                f"`{left_table}`: {left_shape[0]:,} dòng, {left_shape[1]} cột | "
+                f"`{right_table}`: {right_shape[0]:,} dòng, {right_shape[1]} cột"
+            )
+
+            merged_name = st.text_input(
+                "Tên bảng sau merge",
+                value=f"{left_table}_merge_{right_table}",
+            )
+
+            if st.button("Thực hiện Merge"):
+                try:
+                    merged_df = merge_two_tables(
+                        datasets=st.session_state.datasets,
+                        left_table=left_table,
+                        right_table=right_table,
+                        join_key=join_key,
+                        join_type=join_type,
+                    )
+
+                    st.session_state.datasets[merged_name] = merged_df
+                    st.session_state.active_dataset_name = merged_name
+                    reset_derived_states()
+
+                    st.success(
+                        f"Merge thành công. Bảng `{merged_name}` có {merged_df.shape[0]:,} dòng và {merged_df.shape[1]} cột."
+                    )
+                    st.dataframe(merged_df.head(100), use_container_width=True)
+
+                    if merged_df.shape[0] > max(left_shape[0], right_shape[0]) * 2:
+                        st.warning(
+                            "Số dòng sau merge tăng mạnh. Có thể đây là quan hệ one-to-many hoặc many-to-many. "
+                            "Hãy kiểm tra lại key trước khi dùng để model."
+                        )
+                except Exception as e:
+                    st.error(f"Lỗi khi merge: {e}")
+
+
+# =========================================================
+# 10. TAB CLEAN DATA
+# Clean dữ liệu hiện tại và lưu bản clean vào session_state.
+# =========================================================
+
+with tab_clean:
+    st.subheader("🧹 Clean Data")
+    st.caption(f"Đang clean dataset: `{current_dataset_name}`")
+
+    st.markdown("#### Missing Values Report")
+    missing_report = inspect_missing_values(df_current)
+
+    if missing_report.empty:
+        st.success("Không phát hiện missing values.")
+    else:
+        st.dataframe(missing_report, use_container_width=True)
+
+    st.markdown("---")
+
+    if st.button("Thực hiện Auto Clean"):
+        cleaned_df, cleaning_logs = auto_clean_data(df_current)
+        st.session_state.cleaned_df = cleaned_df
+        st.session_state.cleaned_source_name = current_dataset_name
+        st.session_state.cleaning_logs = cleaning_logs
+        st.success("Đã clean dữ liệu thành công.")
+
+    if st.session_state.cleaned_df is not None:
+        st.markdown("#### Cleaning Logs")
+
+        for log in st.session_state.cleaning_logs:
+            st.code(log, language="text")
+
+        old_rows = df_current.shape[0]
+        new_rows = st.session_state.cleaned_df.shape[0]
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Dòng trước clean", f"{old_rows:,}")
+        col2.metric("Dòng sau clean", f"{new_rows:,}")
+        col3.metric("Chênh lệch", f"{old_rows - new_rows:,}")
+
+        st.dataframe(st.session_state.cleaned_df.head(100), use_container_width=True)
+
+        make_download_csv_button(
+            st.session_state.cleaned_df,
+            "Download cleaned data CSV",
+            "cleaned_data.csv",
+        )
+
+
+# =========================================================
+# 11. TAB EDA DASHBOARD
+# EDA chia nhỏ thành Distribution / Scatter / Correlation.
+# Có sample_size để tránh chậm với dataset lớn.
+# =========================================================
+
+with tab_eda:
+    st.subheader("📈 EDA Dashboard")
+    st.caption(f"Dataset hiện tại: `{current_dataset_name}`")
+
+    numeric_cols = df_current.select_dtypes(include=["number"]).columns.tolist()
+    categorical_cols = df_current.select_dtypes(exclude=["number"]).columns.tolist()
+
+    if len(numeric_cols) == 0:
+        st.warning("Dataset hiện tại không có cột số để EDA.")
+    else:
+        max_rows = int(df_current.shape[0])
+
+        if max_rows <= 100:
+            sample_size = max_rows
+        else:
+            sample_size = st.slider(
+                "Số dòng dùng để vẽ biểu đồ",
+                min_value=100,
+                max_value=max_rows,
+                value=min(5000, max_rows),
+                step=100,
+            )
+
+        df_sample = safe_sample_dataframe(df_current, sample_size)
+
+        eda_tab1, eda_tab2, eda_tab3, eda_tab4 = st.tabs([
+            "Distribution",
+            "Scatter & Trendline",
+            "Correlation",
+            "Describe",
+        ])
+
+        with eda_tab1:
+            selected_num_col = st.selectbox(
+                "Chọn cột số để xem phân phối",
+                numeric_cols,
+                key="dist_col",
+            )
+
+            fig_hist = px.histogram(
+                df_sample,
+                x=selected_num_col,
+                nbins=40,
+                title=f"Phân phối của {selected_num_col}",
+                template="plotly_dark",
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            fig_box = px.box(
+                df_sample,
+                y=selected_num_col,
+                title=f"Boxplot của {selected_num_col}",
+                template="plotly_dark",
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
+
+        with eda_tab2:
+            col_x, col_y = st.columns(2)
+
+            with col_x:
+                select_x = st.selectbox("Trục X", numeric_cols, key="scatter_x")
+
+            with col_y:
+                select_y = st.selectbox("Trục Y", numeric_cols, key="scatter_y")
+
+            try:
+                fig_scatter = px.scatter(
+                    df_sample,
+                    x=select_x,
+                    y=select_y,
+                    trendline="ols",
+                    title=f"{select_x} vs {select_y}",
+                    template="plotly_dark",
+                )
+            except Exception:
+                fig_scatter = px.scatter(
+                    df_sample,
+                    x=select_x,
+                    y=select_y,
+                    title=f"{select_x} vs {select_y}",
+                    template="plotly_dark",
+                )
+                st.info("Không vẽ được trendline OLS. Hãy kiểm tra thư viện statsmodels trong requirements.txt.")
+
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+        with eda_tab3:
+            corr_matrix = get_correlation_matrix(df_current)
+
+            if corr_matrix.empty:
+                st.warning("Không đủ cột số để tính correlation.")
+            else:
+                fig_heatmap = px.imshow(
+                    corr_matrix,
+                    text_auto=".2f",
+                    aspect="auto",
+                    title="Correlation Matrix",
+                    color_continuous_scale="RdBu_r",
+                    template="plotly_dark",
+                )
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+
+                target_for_corr = st.selectbox(
+                    "Chọn target để xem top correlation",
+                    numeric_cols,
+                    key="corr_target",
+                )
+
+                if target_for_corr in corr_matrix.columns:
+                    target_corr = corr_matrix[target_for_corr].drop(target_for_corr).dropna()
+                    top_corr = target_corr.abs().sort_values(ascending=False).head(10)
+
+                    top_corr_df = pd.DataFrame({
+                        "Feature": top_corr.index,
+                        "Abs Correlation": top_corr.values,
+                        "Correlation": target_corr[top_corr.index].values,
+                    })
+
+                    st.dataframe(top_corr_df, use_container_width=True)
+
+                    fig_corr_bar = px.bar(
+                        top_corr_df,
+                        x="Feature",
+                        y="Correlation",
+                        title=f"Top correlation với {target_for_corr}",
+                        template="plotly_dark",
+                    )
+                    st.plotly_chart(fig_corr_bar, use_container_width=True)
+
+        with eda_tab4:
+            st.markdown("#### Thống kê mô tả cột số")
+            st.dataframe(df_current[numeric_cols].describe().T, use_container_width=True)
+
+            if categorical_cols:
+                st.markdown("#### Thống kê cột chữ / phân loại")
+                cat_summary = pd.DataFrame({
+                    "Column": categorical_cols,
+                    "Unique Values": [df_current[col].nunique(dropna=True) for col in categorical_cols],
+                    "Missing": [int(df_current[col].isnull().sum()) for col in categorical_cols],
+                })
+                st.dataframe(cat_summary, use_container_width=True)
+
+
+# =========================================================
+# 12. TAB LINEAR REGRESSION
+# Giữ model đơn giản, tập trung vào R² / RMSE / MAE
+# và biểu đồ Actual vs Predicted.
+# =========================================================
+
+with tab_model:
+    st.subheader("🤖 Linear Regression")
+    st.caption(f"Dataset hiện tại: `{current_dataset_name}`")
+
+    df_model = df_current.copy()
+    numeric_cols = df_model.select_dtypes(include=[np.number]).columns.tolist()
 
     if len(numeric_cols) < 2:
-        st.error("Bộ dữ liệu cần ít nhất 2 cột kiểu số để xây dựng mô hình hồi quy tuyến tính")
+        st.error("Cần ít nhất 2 cột số để huấn luyện Linear Regression.")
     else:
-        # Chia giao diện chọn biến thành 2 cột song song gọn gàng
-        col_select1, col_select2 = st.columns(2)
-        
-        with col_select1:
-            target = st.selectbox("Chọn biến mục tiêu (Target - Y):", numeric_cols, index=numeric_cols.index('MEDV') if 'MEDV' in numeric_cols else 0)
-            
-        with col_select2:
+        col_target, col_features = st.columns([1, 2])
+
+        with col_target:
+            target = st.selectbox(
+                "Chọn biến mục tiêu Y",
+                numeric_cols,
+                key="model_target_select",
+            )
+
+        with col_features:
             available_features = [col for col in numeric_cols if col != target]
-            features = st.multiselect("Chọn các biến độc lập (Features - X):", available_features, default=[available_features[0]] if available_features else [])
+            features = st.multiselect(
+                "Chọn biến độc lập X",
+                available_features,
+                default=available_features[:1],
+                key="model_features_select",
+            )
 
-        # Nút bấm bắt đầu huấn luyện mô hình
-        if st.button("Huấn luyện mô hình"):
+        if st.button("Huấn luyện Linear Regression"):
             if not features:
-                st.warning("Vui lòng chọn ít nhất 1 biến độc lập (X)")
+                st.warning("Vui lòng chọn ít nhất 1 biến độc lập.")
             else:
-                # 1. Gọi hàm huấn luyện từ backend (src/models.py)
-                metrics, coefficients, intercept, y_test_vals, y_test_pred = train_linear_regression(df_to_model, features, target)
-                
-                st.success("Huấn luyện mô hình thành công!")
-                
-                # 2. HIỂN THỊ CHỈ SỐ THEO PHONG CÁCH POWER BI (Nằm hoàn toàn trong block IF sau khi bấm nút)
-                st.markdown("### 📊 Bảng điều khiển hiệu năng mô hình (Executive Dashboard)")
-                
-                col_train, col_val, col_test = st.columns(3)
-                
-                with col_train:
-                    with st.container(border=True):
-                        st.markdown("### 🟢 Tập Train (70%)")
-                        sub_c1, sub_c2 = st.columns(2)
-                        sub_c1.metric(label="📊 R² Score", value=f"{metrics['train_r2']:.4f}")
-                        sub_c2.metric(label="📉 RMSE", value=f"{metrics['train_rmse']:.2f}")
-                        st.caption("Mức độ học thuộc của dữ liệu")
+                try:
+                    metrics, coefficients, intercept, y_test_vals, y_test_pred = train_linear_regression(
+                        df_model,
+                        features,
+                        target,
+                    )
 
-                with col_val:
-                    with st.container(border=True):
-                        st.markdown("### 🟡 Tập Validation (15%)")
-                        sub_c1, sub_c2 = st.columns(2)
-                        sub_c1.metric(label="📊 R² Score", value=f"{metrics['val_r2']:.4f}")
-                        sub_c2.metric(label="📉 RMSE", value=f"{metrics['val_rmse']:.2f}")
-                        st.caption("Chỉ số kiểm định tham số")
+                    st.session_state.model_metrics = metrics
+                    st.session_state.model_coefficients = coefficients
+                    st.session_state.model_intercept = intercept
+                    st.session_state.model_target = target
+                    st.session_state.model_features = features
+                    st.success("Huấn luyện mô hình thành công.")
+                except Exception as e:
+                    st.error(f"Lỗi khi huấn luyện mô hình: {e}")
+                    st.stop()
 
-                with col_test:
-                    with st.container(border=True):
-                        st.markdown("### 🔵 Tập Test (15%)")
-                        sub_c1, sub_c2 = st.columns(2)
-                        sub_c1.metric(label="📊 R² Score", value=f"{metrics['test_r2']:.4f}")
-                        sub_c2.metric(label="📉 RMSE", value=f"{metrics['test_rmse']:.2f}")
-                        st.caption("Khả năng dự đoán thực tế")
+        if st.session_state.model_metrics is not None:
+            metrics = st.session_state.model_metrics
+            coefficients = st.session_state.model_coefficients
+            intercept = st.session_state.model_intercept
 
-                # Xếp thông số phương trình và biểu đồ nằm ngang hàng nhau
-                st.markdown("---")
-                col_model_info, col_chart = st.columns([2, 3])
-                
-                with col_model_info:
-                    with st.container(border=True):
-                        st.markdown("#### 📐 Thông số phương trình hồi quy:")
-                        st.dataframe(coefficients, use_container_width=True)
-                        st.info(f"Hệ số chặn (Intercept / Bias b): `{intercept:.4f}`")
-                        
-                with col_chart:
-                    with st.container(border=True):
-                        st.markdown("#### 📈 Biểu đồ kiểm chứng (Tập Test)")
-                        
-                        # Vẽ biểu đồ kiểm chứng thực tế vs dự đoán bằng Plotly
-                        import plotly.graph_objects as go
-                        
-                        fig_test = go.Figure()
-                        # Vẽ các điểm dữ liệu thực tế
-                        fig_test.add_trace(go.Scatter(x=y_test_vals, y=y_test_pred, mode='markers', name='Dữ liệu Test thực tế', marker=dict(color='blue')))
-                        
-                        # Vẽ đường chuẩn hoàn hảo 45 độ (Dự đoán đúng hoàn toàn)
-                        min_val = min(min(y_test_vals), min(y_test_pred))
-                        max_val = max(max(y_test_vals), max(y_test_pred))
-                        fig_test.add_trace(go.Scatter(x=[min_val, max_val], y=[min_val, max_val], mode='lines', name='Đường chuẩn hoàn hảo', line=dict(color='white', dash='dash')))
-                        
-                        fig_test.update_layout(title="Thực tế vs Dự đoán (Actual vs Predicted)", xaxis_title="Giá trị thực tế (Actual Y)", yaxis_title="Giá trị dự đoán (Predicted Y)", template="plotly_dark", height=350)
-                        st.plotly_chart(fig_test, use_container_width=True)
+            st.markdown("### Model Performance Dashboard")
+            col_train, col_val, col_test = st.columns(3)
+
+            with col_train:
+                with st.container(border=True):
+                    st.markdown("#### Train 70%")
+                    st.metric("R²", f"{metrics['train_r2']:.4f}")
+                    st.metric("RMSE", f"{metrics['train_rmse']:.4f}")
+                    st.metric("MAE", f"{metrics['train_mae']:.4f}")
+
+            with col_val:
+                with st.container(border=True):
+                    st.markdown("#### Validation 15%")
+                    st.metric("R²", f"{metrics['val_r2']:.4f}")
+                    st.metric("RMSE", f"{metrics['val_rmse']:.4f}")
+                    st.metric("MAE", f"{metrics['val_mae']:.4f}")
+
+            with col_test:
+                with st.container(border=True):
+                    st.markdown("#### Test 15%")
+                    st.metric("R²", f"{metrics['test_r2']:.4f}")
+                    st.metric("RMSE", f"{metrics['test_rmse']:.4f}")
+                    st.metric("MAE", f"{metrics['test_mae']:.4f}")
+
+            st.markdown("---")
+
+            col_coef, col_note = st.columns([1.3, 1])
+
+            with col_coef:
+                st.markdown("#### Hệ số mô hình")
+                st.dataframe(coefficients, use_container_width=True)
+                st.info(f"Intercept: {intercept:.4f}")
+
+            with col_note:
+                st.markdown("#### Cách đọc nhanh")
+                st.write(
+                    "Hệ số dương nghĩa là khi feature tăng thì target có xu hướng tăng, "
+                    "hệ số âm nghĩa là khi feature tăng thì target có xu hướng giảm. "
+                    "Lưu ý: với dữ liệu chưa scale, độ lớn hệ số chưa phản ánh hoàn toàn tầm quan trọng của biến."
+                )
+
+            # Vẽ lại Actual vs Predicted bằng cách train lại nhanh để lấy y_test và y_pred.
+            # Lý do: y_test/y_pred không nên lưu quá nhiều trong session khi dataset lớn.
+            try:
+                _, _, _, y_test_vals, y_test_pred = train_linear_regression(
+                    df_model,
+                    st.session_state.model_features,
+                    st.session_state.model_target,
+                )
+
+                fig_test = go.Figure()
+                fig_test.add_trace(
+                    go.Scatter(
+                        x=y_test_vals,
+                        y=y_test_pred,
+                        mode="markers",
+                        name="Actual vs Predicted",
+                    )
+                )
+
+                min_val = min(min(y_test_vals), min(y_test_pred))
+                max_val = max(max(y_test_vals), max(y_test_pred))
+
+                fig_test.add_trace(
+                    go.Scatter(
+                        x=[min_val, max_val],
+                        y=[min_val, max_val],
+                        mode="lines",
+                        name="Perfect Prediction",
+                        line=dict(dash="dash"),
+                    )
+                )
+
+                fig_test.update_layout(
+                    title="Actual vs Predicted trên tập Test",
+                    xaxis_title="Actual Y",
+                    yaxis_title="Predicted Y",
+                    template="plotly_dark",
+                    height=450,
+                )
+
+                st.plotly_chart(fig_test, use_container_width=True)
+            except Exception as e:
+                st.warning(f"Không thể vẽ Actual vs Predicted: {e}")
+
+
+# =========================================================
+# 13. TAB EXPORT REPORT
+# Xuất HTML report và CSV của dataset hiện tại.
+# =========================================================
+
+with tab_report:
+    st.subheader("📤 Export Report")
+    st.caption("Report gồm dataset overview, missing values, cleaning logs và kết quả model nếu đã train.")
+
+    missing_report = inspect_missing_values(df_current)
+
+    report_html = generate_html_report(
+        app_title="Automated Data Science Toolkit",
+        dataset_name=current_dataset_name or "Unknown Dataset",
+        df=df_current,
+        missing_report=missing_report,
+        cleaning_logs=st.session_state.cleaning_logs,
+        model_metrics=st.session_state.model_metrics,
+        coefficients=st.session_state.model_coefficients,
+        target=st.session_state.model_target,
+        features=st.session_state.model_features,
+    )
+
+    col_report, col_csv = st.columns(2)
+
+    with col_report:
+        st.download_button(
+            label="Download HTML Report",
+            data=report_html,
+            file_name="adst_report.html",
+            mime="text/html",
+        )
+
+    with col_csv:
+        make_download_csv_button(
+            df_current,
+            "Download current dataset CSV",
+            "current_dataset.csv",
+        )
+
+    if st.session_state.cleaned_df is not None:
+        make_download_csv_button(
+            st.session_state.cleaned_df,
+            "Download cleaned dataset CSV",
+            "cleaned_dataset.csv",
+        )
